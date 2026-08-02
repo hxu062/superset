@@ -20,9 +20,13 @@ WebDriver connection pooling for improved screenshot performance
 """
 
 import logging
-import signal
 import threading
 import time
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeout,
+)
 from contextlib import contextmanager
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
@@ -43,9 +47,16 @@ class WebDriverCreationError(Exception):
     pass
 
 
-def _timeout_handler(signum: int, frame: Any) -> None:
-    """Signal handler for WebDriver creation timeout"""
-    raise WebDriverCreationError("WebDriver creation timed out")
+def _quit_late_driver(future: "Future[WebDriver]") -> None:
+    """Quit a driver that finished being created after the timeout elapsed"""
+    try:
+        driver = future.result()
+    except Exception:  # pylint: disable=broad-except
+        return
+    try:
+        driver.quit()
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("Failed to cleanup driver created after timeout")
 
 
 @dataclass
@@ -115,70 +126,63 @@ class WebDriverPool:
                 "max_pool_size": self.max_pool_size,
             }
 
+    @staticmethod
+    def _build_driver(driver_type: str, window_size: WindowSize) -> WebDriver:
+        """Build a WebDriver instance, cleaning it up if setup fails"""
+        selenium_driver = WebDriverSelenium(driver_type, window_size)
+        driver = selenium_driver.create()
+        try:
+            driver.set_window_size(*window_size)
+        except Exception:
+            try:
+                driver.quit()
+            except Exception:  # pylint: disable=broad-except
+                logger.debug("Failed to cleanup driver during error")
+            raise
+        return driver
+
     def _create_driver(
         self, window_size: WindowSize, user_id: int | None = None
     ) -> PooledWebDriver:
         """Create a new WebDriver instance with timeout protection"""
-        driver = None
-        old_handler = None
+        driver_type = current_app.config.get("WEBDRIVER_TYPE", "firefox")
 
+        # Creation runs on a worker thread so the timeout can be enforced from
+        # any thread. A driver that shows up after the timeout is quit by the
+        # done callback, since the creation thread cannot be cancelled.
+        executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="webdriver-create"
+        )
         try:
-            # SECURITY FIX: Set up timeout protection for driver creation
-            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(self.creation_timeout_seconds)
-
-            driver_type = current_app.config.get("WEBDRIVER_TYPE", "firefox")
-            selenium_driver = WebDriverSelenium(driver_type, window_size)
-
-            # Create the actual WebDriver with timeout protection
-            driver = selenium_driver.create()
-            driver.set_window_size(*window_size)
-
-            # Clear the alarm - creation successful
-            signal.alarm(0)
-
-            pooled_driver = PooledWebDriver(
-                driver=driver,
-                created_at=time.time(),
-                last_used=time.time(),
-                window_size=window_size,
-                user_id=user_id,
-                is_healthy=True,
-                usage_count=0,
-            )
-
-            self._stats["created"] += 1
-            logger.debug(
-                "Created new WebDriver instance for window size %s", window_size
-            )
-            return pooled_driver
-
-        except WebDriverCreationError:
-            logger.error(
-                "WebDriver creation timed out after %s seconds",
-                self.creation_timeout_seconds,
-            )
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    logger.debug("Failed to cleanup driver during timeout")
-            raise Exception("WebDriver creation timed out") from None
-
-        except Exception as e:
-            logger.error("Failed to create WebDriver: %s", e)
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    logger.debug("Failed to cleanup driver during error")
-            raise
-
+            future = executor.submit(self._build_driver, driver_type, window_size)
+            try:
+                driver = future.result(timeout=self.creation_timeout_seconds)
+            except FutureTimeout:
+                future.add_done_callback(_quit_late_driver)
+                logger.error(
+                    "WebDriver creation timed out after %s seconds",
+                    self.creation_timeout_seconds,
+                )
+                raise WebDriverCreationError("WebDriver creation timed out") from None
+            except Exception as e:
+                logger.error("Failed to create WebDriver: %s", e)
+                raise
         finally:
-            # Restore original signal handler and clear alarm
-            signal.alarm(0)
-            if old_handler is not None:
-                signal.signal(signal.SIGALRM, old_handler)
+            executor.shutdown(wait=False)
+
+        pooled_driver = PooledWebDriver(
+            driver=driver,
+            created_at=time.time(),
+            last_used=time.time(),
+            window_size=window_size,
+            user_id=user_id,
+            is_healthy=True,
+            usage_count=0,
+        )
+
+        self._stats["created"] += 1
+        logger.debug("Created new WebDriver instance for window size %s", window_size)
+        return pooled_driver
 
     def _is_driver_valid(self, pooled_driver: PooledWebDriver) -> bool:
         """Check if a pooled driver is still valid for use"""
