@@ -16,20 +16,24 @@
 # under the License.
 import re
 from datetime import date, datetime, timedelta
-from typing import Optional
+from pathlib import Path
+from typing import get_type_hints, Optional
 from unittest.mock import Mock, patch
 
 import freezegun
 import pytest
 from dateutil.relativedelta import relativedelta
+from pyparsing import ParserElement
 
 from superset.commands.chart.exceptions import (
     TimeRangeAmbiguousError,
     TimeRangeParseFailError,
 )
+from superset.utils import date_parser
 from superset.utils.date_parser import (
     DateRangeMigration,
     datetime_eval,
+    datetime_parser,
     get_past_or_future,
     get_since_until,
     is_constant_human_timedelta,
@@ -355,6 +359,26 @@ def test_previous_calendar_quarter():
         result = get_since_until("previous calendar quarter")
         expected = (datetime(2023, 10, 1), datetime(2024, 1, 1))
         assert result == expected
+
+
+def test_datetime_parser_return_type() -> None:
+    """The grammar builder returns a ParserElement, and says so."""
+    assert get_type_hints(datetime_parser)["return"] is ParserElement
+    assert isinstance(datetime_parser(), ParserElement)
+
+
+def test_datetime_parser_type_checks_clean() -> None:
+    """The grammar builder is free of mypy operator/return-value errors."""
+    mypy_api = pytest.importorskip("mypy.api")
+    module = Path(date_parser.__file__).resolve()
+    stdout, _, _ = mypy_api.run(["--check-untyped-defs", str(module)])
+    offending = [
+        line
+        for line in stdout.splitlines()
+        if line.startswith(f"{module}:")
+        and ("[operator]" in line or "[return-value]" in line)
+    ]
+    assert not offending, "\n".join(offending)
 
 
 @patch("superset.utils.date_parser.parse_human_datetime", mock_parse_human_datetime)
