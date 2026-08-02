@@ -280,6 +280,42 @@ def _stabilize_chart_ids(payload: dict[str, Any]) -> None:
         metadata["chart_configuration"] = new_chart_configuration
 
 
+def _iter_filter_targets(
+    payload: dict[str, Any],
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield ``(kind, target)`` for every dataset-bearing filter target.
+
+    Centralizes the nested traversal over ``native_filter_configuration`` and
+    ``chart_customization_config`` targets so ``_file_content`` and ``_export``
+    walk the payload identically and cannot drift. ``kind`` is
+    ``"native_filter"`` or ``"chart_customization"``.
+    """
+    metadata = payload.get("metadata") or {}
+    for native_filter in metadata.get("native_filter_configuration") or []:
+        for target in native_filter.get("targets") or []:
+            yield "native_filter", target
+    for customization in metadata.get("chart_customization_config") or []:
+        for target in customization.get("targets") or []:
+            yield "chart_customization", target
+
+
+def _resolve_filter_datasets(payload: dict[str, Any]) -> dict[int, Any]:
+    """Bulk-resolve every dataset referenced by the payload's filter targets.
+
+    Collects the distinct ``datasetId`` values across all filter targets and
+    resolves them in a single ``find_by_ids`` query (instead of one
+    ``find_by_id`` per target), returning a ``{dataset_id: dataset}`` mapping.
+    """
+    dataset_ids = list(
+        {
+            dataset_id
+            for _, target in _iter_filter_targets(payload)
+            if (dataset_id := target.get("datasetId")) is not None
+        }
+    )
+    return {dataset.id: dataset for dataset in DatasetDAO.find_by_ids(dataset_ids)}
+
+
 class ExportDashboardsCommand(ExportModelsCommand):
     dao = DashboardDAO
     not_found = DashboardNotFoundError
@@ -309,38 +345,30 @@ class ExportDashboardsCommand(ExportModelsCommand):
                     logger.info("Unable to decode `%s` field: %s", key, value)
                     payload[new_name] = {}
 
-        # Extract all native filter datasets and replace native
-        # filter dataset references with uuid
-        for native_filter in payload.get("metadata", {}).get(
-            "native_filter_configuration", []
-        ):
-            for target in native_filter.get("targets", []):
+        # Resolve every referenced dataset in a single bulk query, then replace
+        # dataset references with the dataset uuid. Native-filter targets drop
+        # datasetId in favor of datasetUuid; display-control targets preserve
+        # datasetId alongside datasetUuid so that bundles remain importable by
+        # older versions that do not yet understand datasetUuid for those
+        # targets.
+        datasets_by_id = _resolve_filter_datasets(payload)
+        for kind, target in _iter_filter_targets(payload):
+            if kind == "native_filter":
                 dataset_id = target.pop("datasetId", None)
-                if dataset_id is not None:
-                    dataset = DatasetDAO.find_by_id(dataset_id)
-                    if dataset:
-                        target["datasetUuid"] = str(dataset.uuid)
-
-        # Replace display control dataset references with uuid.
-        # datasetId is intentionally preserved alongside datasetUuid so that
-        # bundles remain importable by older versions that do not yet understand
-        # datasetUuid for display-control targets.
-        for customization in (
-            payload.get("metadata", {}).get("chart_customization_config") or []
-        ):
-            for target in customization.get("targets") or []:
+            else:
                 dataset_id = target.get("datasetId")
-                if dataset_id is not None:
-                    dataset = DatasetDAO.find_by_id(dataset_id)
-                    if dataset:
-                        target["datasetUuid"] = str(dataset.uuid)
-                    else:
-                        logger.warning(
-                            "Dashboard '%s': display control target references "
-                            "missing dataset %s; datasetUuid will not be set",
-                            model.dashboard_title,
-                            dataset_id,
-                        )
+            if dataset_id is None:
+                continue
+            dataset = datasets_by_id.get(dataset_id)
+            if dataset:
+                target["datasetUuid"] = str(dataset.uuid)
+            elif kind == "chart_customization":
+                logger.warning(
+                    "Dashboard '%s': display control target references "
+                    "missing dataset %s; datasetUuid will not be set",
+                    model.dashboard_title,
+                    dataset_id,
+                )
 
         # the mapping between dashboard -> charts is inferred from the position
         # attribute, so if it's not present we need to add a default config
@@ -421,24 +449,20 @@ class ExportDashboardsCommand(ExportModelsCommand):
                     payload[new_name] = {}
 
         if export_related:
-            # Extract all native filter datasets and export referenced datasets
-            for native_filter in payload.get("metadata", {}).get(
-                "native_filter_configuration", []
-            ):
-                for target in native_filter.get("targets", []):
-                    dataset_id = target.pop("datasetId", None)
-                    if dataset_id is not None:
-                        dataset = DatasetDAO.find_by_id(dataset_id)
-                        if dataset:
-                            yield from ExportDatasetsCommand([dataset_id]).run()
-
-            # Export datasets referenced by display controls
-            for customization in (
-                payload.get("metadata", {}).get("chart_customization_config") or []
-            ):
-                for target in customization.get("targets") or []:
-                    dataset_id = target.get("datasetId")
-                    if dataset_id is not None:
-                        dataset = DatasetDAO.find_by_id(dataset_id)
-                        if dataset:
-                            yield from ExportDatasetsCommand([dataset_id]).run()
+            # Export every dataset referenced by native filters and display
+            # controls. Ids are collected across all targets, resolved in a
+            # single bulk query, de-duplicated, and filtered to existing
+            # datasets (preserving the silently-skip-missing behavior) before a
+            # single ExportDatasetsCommand invocation — rather than a lookup and
+            # command per target.
+            datasets_by_id = _resolve_filter_datasets(payload)
+            dataset_ids = [
+                dataset_id
+                for dataset_id in dict.fromkeys(
+                    target.get("datasetId")
+                    for _, target in _iter_filter_targets(payload)
+                )
+                if dataset_id in datasets_by_id
+            ]
+            if dataset_ids:
+                yield from ExportDatasetsCommand(dataset_ids).run()

@@ -82,12 +82,13 @@ def test_file_content_replaces_dataset_id_with_uuid_in_display_controls():
     )
 
     mock_dataset = MagicMock()
+    mock_dataset.id = 99
     mock_dataset.uuid = dataset_uuid
 
     with (
         patch(
-            "superset.commands.dashboard.export.DatasetDAO.find_by_id",
-            return_value=mock_dataset,
+            "superset.commands.dashboard.export.DatasetDAO.find_by_ids",
+            return_value=[mock_dataset],
         ),
         patch(
             "superset.commands.dashboard.export.feature_flag_manager.is_feature_enabled",
@@ -134,14 +135,15 @@ def test_export_yields_dataset_files_for_display_controls():
     )
 
     mock_dataset = MagicMock()
+    mock_dataset.id = dataset_id
     sentinel_file = ("datasets/my_dataset.yaml", lambda: "dataset_content")
     mock_datasets_cmd = MagicMock()
     mock_datasets_cmd.run.return_value = iter([sentinel_file])
 
     with (
         patch(
-            "superset.commands.dashboard.export.DatasetDAO.find_by_id",
-            return_value=mock_dataset,
+            "superset.commands.dashboard.export.DatasetDAO.find_by_ids",
+            return_value=[mock_dataset],
         ),
         patch(
             "superset.commands.dashboard.export.ExportDatasetsCommand",
@@ -706,8 +708,8 @@ def test_file_content_missing_dataset_preserves_dataset_id() -> None:
 
     with (
         patch(
-            "superset.commands.dashboard.export.DatasetDAO.find_by_id",
-            return_value=None,
+            "superset.commands.dashboard.export.DatasetDAO.find_by_ids",
+            return_value=[],
         ),
         patch(
             "superset.commands.dashboard.export.feature_flag_manager.is_feature_enabled",
@@ -763,3 +765,104 @@ def test_stabilize_chart_ids_resolves_id_collisions() -> None:
     assert {id_a, id_b} == {100, 101}
     # Neither expanded_slices entry was dropped by a key clash.
     assert set(payload["metadata"]["expanded_slices"]) == {str(id_a), str(id_b)}
+
+
+def _dashboard_with_repeated_target_dataset(num_targets: int, dataset_id: int):
+    """Build a dashboard whose N native-filter targets all point at one dataset."""
+    return _make_mock_dashboard(
+        {
+            "native_filter_configuration": [
+                {
+                    "id": f"NATIVE_FILTER-{i}",
+                    "targets": [{"datasetId": dataset_id, "column": {"name": "col"}}],
+                }
+                for i in range(num_targets)
+            ],
+            "chart_customization_config": [],
+        }
+    )
+
+
+def test_file_content_dataset_lookup_is_constant_in_target_count() -> None:
+    """
+    Regression for #9: resolving filter dataset references must cost a constant
+    number of metadata-DB queries regardless of how many filter targets share a
+    dataset — a single bulk ``find_by_ids`` rather than one ``find_by_id`` per
+    target.
+    """
+    from superset.commands.dashboard.export import ExportDashboardsCommand
+
+    dataset_uuid = str(uuid.uuid4())
+    mock_dataset = MagicMock()
+    mock_dataset.id = 7
+    mock_dataset.uuid = dataset_uuid
+
+    def run_and_count(num_targets: int) -> int:
+        dashboard = _dashboard_with_repeated_target_dataset(num_targets, 7)
+        with (
+            patch(
+                "superset.commands.dashboard.export.DatasetDAO.find_by_ids",
+                return_value=[mock_dataset],
+            ) as mock_find_by_ids,
+            patch(
+                "superset.commands.dashboard.export.feature_flag_manager"
+                ".is_feature_enabled",
+                return_value=False,
+            ),
+        ):
+            content = ExportDashboardsCommand._file_content(dashboard)
+        result = yaml.safe_load(content)
+        # Every target still resolves to the dataset uuid — output is unchanged.
+        for native_filter in result["metadata"]["native_filter_configuration"]:
+            assert native_filter["targets"][0]["datasetUuid"] == dataset_uuid
+        return mock_find_by_ids.call_count
+
+    # The query count is constant (1) and does not scale with the target count.
+    assert run_and_count(1) == 1
+    assert run_and_count(40) == 1
+
+
+def test_export_dedupes_dataset_ids_into_single_command() -> None:
+    """
+    Regression for #9: ``_export`` must resolve dataset ids in one bulk query and
+    invoke ``ExportDatasetsCommand`` once with the de-duplicated set of ids,
+    rather than once per filter target.
+    """
+    from superset.commands.dashboard.export import ExportDashboardsCommand
+
+    dataset_id = 7
+    mock_dashboard = _dashboard_with_repeated_target_dataset(40, dataset_id)
+
+    mock_dataset = MagicMock()
+    mock_dataset.id = dataset_id
+    mock_datasets_cmd = MagicMock()
+    mock_datasets_cmd.run.return_value = iter(
+        [("datasets/ds.yaml", lambda: "content")]
+    )
+
+    with (
+        patch(
+            "superset.commands.dashboard.export.DatasetDAO.find_by_ids",
+            return_value=[mock_dataset],
+        ) as mock_find_by_ids,
+        patch(
+            "superset.commands.dashboard.export.ExportDatasetsCommand",
+            return_value=mock_datasets_cmd,
+        ) as mock_datasets_cls,
+        patch(
+            "superset.commands.dashboard.export.ExportChartsCommand"
+        ) as mock_charts_cls,
+        patch(
+            "superset.commands.dashboard.export.feature_flag_manager"
+            ".is_feature_enabled",
+            return_value=False,
+        ),
+    ):
+        mock_charts_cls.return_value.run.return_value = iter([])
+        results = list(ExportDashboardsCommand._export(mock_dashboard))
+
+    # One bulk lookup and one export command, despite 40 targets over 1 dataset.
+    mock_find_by_ids.assert_called_once()
+    mock_datasets_cls.assert_called_once_with([dataset_id])
+    mock_datasets_cmd.run.assert_called_once()
+    assert "datasets/ds.yaml" in [name for name, _ in results]
