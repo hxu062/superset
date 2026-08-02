@@ -1195,49 +1195,79 @@ def test_configuration_schema_enrichment_error_fallback(
     assert mock_cls.get_configuration_schema.call_count == 2
 
 
-@SEMANTIC_LAYERS_APP
-def test_connections_list(
-    client: Any,
-    full_api_access: None,
+@pytest.fixture
+def connections_session(session: Any) -> Any:
+    """In-memory metadata DB with the tables the connections endpoint reads.
+
+    ``Database`` and ``SemanticLayer`` share the same declarative metadata, so
+    a single ``create_all`` provisions both ``dbs`` and ``semantic_layers``
+    (plus the ``ab_user`` table needed to eager-load ``changed_by``).
+    """
+    from superset.semantic_layers.models import SemanticLayer
+
+    engine = session.get_bind()
+    SemanticLayer.metadata.create_all(engine)  # pylint: disable=no-member
+    return session
+
+
+def _make_user(session: Any, username: str = "creator") -> Any:
+    from flask_appbuilder.security.sqla.models import User
+
+    user = User(
+        username=username,
+        first_name="Cre",
+        last_name="Ator",
+        email=f"{username}@example.com",
+    )
+    session.add(user)
+    session.flush()
+    return user
+
+
+def _make_database(session: Any, name: str, changed_by: Any = None) -> Any:
+    from superset.models.core import Database
+
+    obj = Database(
+        database_name=name,
+        sqlalchemy_uri="postgresql://user:pass@localhost:5432/db",
+    )
+    if changed_by is not None:
+        obj.changed_by = changed_by
+    session.add(obj)
+    session.flush()
+    return obj
+
+
+def _make_layer(
+    session: Any, name: str, sl_type: str = "snowflake", changed_by: Any = None
+) -> Any:
+    from superset.semantic_layers.models import SemanticLayer
+
+    obj = SemanticLayer(
+        uuid=uuid_lib.uuid4(),
+        name=name,
+        type=sl_type,
+        configuration="{}",
+    )
+    if changed_by is not None:
+        obj.changed_by = changed_by
+    session.add(obj)
+    session.flush()
+    return obj
+
+
+def _patch_connections_env(
     mocker: MockerFixture,
-) -> None:
-    """Test GET /connections/ returns combined database and layer list."""
-    from datetime import datetime
-
-    mock_db = MagicMock()
-    mock_db.id = 1
-    mock_db.uuid = uuid_lib.uuid4()
-    mock_db.database_name = "PostgreSQL"
-    mock_db.backend = "postgresql"
-    mock_db.allow_run_async = False
-    mock_db.allow_dml = False
-    mock_db.allow_file_upload = False
-    mock_db.expose_in_sqllab = True
-    mock_db.changed_on = datetime(2026, 1, 1)
-    mock_db.changed_on_delta_humanized.return_value = "1 month ago"
-    mock_db.changed_by = None
-
-    mock_layer = MagicMock()
-    mock_layer.uuid = uuid_lib.uuid4()
-    mock_layer.name = "My Layer"
-    mock_layer.type = "snowflake"
-    mock_layer.description = "A layer"
-    mock_layer.cache_timeout = None
-    mock_layer.changed_on = datetime(2026, 2, 1)
-    mock_layer.changed_on_delta_humanized.return_value = "1 day ago"
-    mock_layer.changed_by = None
-
-    mock_db_session = mocker.patch("superset.semantic_layers.api.db.session")
-    db_query = MagicMock()
-    db_query.options.return_value = db_query
-    db_query.all.return_value = [mock_db]
-    db_query.filter.return_value = db_query
-    sl_query = MagicMock()
-    sl_query.options.return_value = sl_query
-    sl_query.all.return_value = [mock_layer]
-    sl_query.filter.return_value = sl_query
-    mock_db_session.query.side_effect = [db_query, sl_query]
-
+    all_access: bool = True,
+) -> MagicMock:
+    mocker.patch(
+        "superset.semantic_layers.api.is_feature_enabled",
+        return_value=True,
+    )
+    mocker.patch(
+        "superset.semantic_layers.api.security_manager.can_access_all_datasources",
+        return_value=all_access,
+    )
     mock_cls = MagicMock()
     mock_cls.name = "Snowflake"
     mocker.patch.dict(
@@ -1245,11 +1275,20 @@ def test_connections_list(
         {"snowflake": mock_cls},
         clear=True,
     )
+    return mock_cls
 
-    mocker.patch(
-        "superset.semantic_layers.api.is_feature_enabled",
-        return_value=True,
-    )
+
+@SEMANTIC_LAYERS_APP
+def test_connections_list(
+    client: Any,
+    full_api_access: None,
+    mocker: MockerFixture,
+    connections_session: Any,
+) -> None:
+    """Test GET /connections/ returns combined database and layer list."""
+    _patch_connections_env(mocker)
+    _make_database(connections_session, "PostgreSQL")
+    _make_layer(connections_session, "My Layer")
 
     response = client.get("/api/v1/semantic_layer/connections/")
 
@@ -1257,16 +1296,16 @@ def test_connections_list(
     assert response.json["count"] == 2
     result = response.json["result"]
     assert len(result) == 2
+    assert {r["source_type"] for r in result} == {"database", "semantic_layer"}
 
 
 @SEMANTIC_LAYERS_APP
-def test_connections_database_only(
+def test_connections_feature_flag_disabled(
     client: Any,
     full_api_access: None,
     mocker: MockerFixture,
 ) -> None:
-    """Test GET /connections/ returns 404 when feature flag is disabled."""
-
+    """Test GET /connections/ returns 404 when the feature flag is disabled."""
     mocker.patch(
         "superset.semantic_layers.api.is_feature_enabled",
         return_value=False,
@@ -1282,36 +1321,26 @@ def test_connections_name_filter(
     client: Any,
     full_api_access: None,
     mocker: MockerFixture,
+    connections_session: Any,
 ) -> None:
-    """Test GET /connections/ with name filter."""
-    mock_db_session = mocker.patch("superset.semantic_layers.api.db.session")
-    db_query = MagicMock()
-    db_query.options.return_value = db_query
-    db_query.all.return_value = []
-    db_query.filter.return_value = db_query
-    sl_query = MagicMock()
-    sl_query.options.return_value = sl_query
-    sl_query.all.return_value = []
-    sl_query.filter.return_value = sl_query
-    mock_db_session.query.side_effect = [db_query, sl_query]
-
-    mocker.patch(
-        "superset.semantic_layers.api.is_feature_enabled",
-        return_value=True,
-    )
-
+    """Test GET /connections/ filters both sources by name in SQL."""
     import prison as rison_lib
 
+    _patch_connections_env(mocker)
+    _make_database(connections_session, "PostgreSQL")
+    _make_database(connections_session, "MySQL")
+    _make_layer(connections_session, "Postgres Analytics")
+    _make_layer(connections_session, "Snowflake Layer")
+
     q = rison_lib.dumps(
-        {"filters": [{"col": "database_name", "opr": "ct", "value": "post"}]}
+        {"filters": [{"col": "database_name", "opr": "ct", "value": "postgres"}]}
     )
     response = client.get(f"/api/v1/semantic_layer/connections/?q={q}")
 
     assert response.status_code == 200
-    assert response.json["count"] == 0
-    # Verify filter was applied to both queries
-    db_query.filter.assert_called_once()
-    sl_query.filter.assert_called_once()
+    assert response.json["count"] == 2
+    names = {r["database_name"] for r in response.json["result"]}
+    assert names == {"PostgreSQL", "Postgres Analytics"}
 
 
 @SEMANTIC_LAYERS_APP
@@ -1319,56 +1348,14 @@ def test_connections_sort_by_name(
     client: Any,
     full_api_access: None,
     mocker: MockerFixture,
+    connections_session: Any,
 ) -> None:
-    """Test GET /connections/ sorts by database_name."""
-    from datetime import datetime
-
-    mock_db = MagicMock()
-    mock_db.id = 1
-    mock_db.uuid = uuid_lib.uuid4()
-    mock_db.database_name = "Zebra DB"
-    mock_db.backend = "postgresql"
-    mock_db.allow_run_async = False
-    mock_db.allow_dml = False
-    mock_db.allow_file_upload = False
-    mock_db.expose_in_sqllab = True
-    mock_db.changed_on = datetime(2026, 1, 1)
-    mock_db.changed_on_delta_humanized.return_value = "1 month ago"
-    mock_db.changed_by = None
-
-    mock_layer = MagicMock()
-    mock_layer.uuid = uuid_lib.uuid4()
-    mock_layer.name = "Alpha Layer"
-    mock_layer.type = "snowflake"
-    mock_layer.description = None
-    mock_layer.cache_timeout = None
-    mock_layer.changed_on = datetime(2026, 2, 1)
-    mock_layer.changed_on_delta_humanized.return_value = "1 day ago"
-    mock_layer.changed_by = None
-
-    mock_db_session = mocker.patch("superset.semantic_layers.api.db.session")
-    db_query = MagicMock()
-    db_query.options.return_value = db_query
-    db_query.all.return_value = [mock_db]
-    sl_query = MagicMock()
-    sl_query.options.return_value = sl_query
-    sl_query.all.return_value = [mock_layer]
-    mock_db_session.query.side_effect = [db_query, sl_query]
-
-    mock_cls = MagicMock()
-    mock_cls.name = "Snowflake"
-    mocker.patch.dict(
-        "superset.semantic_layers.api.registry",
-        {"snowflake": mock_cls},
-        clear=True,
-    )
-
-    mocker.patch(
-        "superset.semantic_layers.api.is_feature_enabled",
-        return_value=True,
-    )
-
+    """Test GET /connections/ sorts the combined list by name in SQL."""
     import prison as rison_lib
+
+    _patch_connections_env(mocker)
+    _make_database(connections_session, "Zebra DB")
+    _make_layer(connections_session, "Alpha Layer")
 
     q = rison_lib.dumps({"order_column": "database_name", "order_direction": "asc"})
     response = client.get(f"/api/v1/semantic_layer/connections/?q={q}")
@@ -1380,39 +1367,18 @@ def test_connections_sort_by_name(
 
 
 @SEMANTIC_LAYERS_APP
-def test_connections_source_type_filter(
+def test_connections_source_type_database(
     client: Any,
     full_api_access: None,
     mocker: MockerFixture,
+    connections_session: Any,
 ) -> None:
-    """Test GET /connections/ with source_type filter."""
-    from datetime import datetime
-
-    mock_db = MagicMock()
-    mock_db.id = 1
-    mock_db.uuid = uuid_lib.uuid4()
-    mock_db.database_name = "PostgreSQL"
-    mock_db.backend = "postgresql"
-    mock_db.allow_run_async = False
-    mock_db.allow_dml = False
-    mock_db.allow_file_upload = False
-    mock_db.expose_in_sqllab = True
-    mock_db.changed_on = datetime(2026, 1, 1)
-    mock_db.changed_on_delta_humanized.return_value = "1 month ago"
-    mock_db.changed_by = None
-
-    mock_db_session = mocker.patch("superset.semantic_layers.api.db.session")
-    db_query = MagicMock()
-    db_query.options.return_value = db_query
-    db_query.all.return_value = [mock_db]
-    mock_db_session.query.return_value = db_query
-
-    mocker.patch(
-        "superset.semantic_layers.api.is_feature_enabled",
-        return_value=True,
-    )
-
+    """Test GET /connections/ with source_type=database excludes layers."""
     import prison as rison_lib
+
+    _patch_connections_env(mocker)
+    _make_database(connections_session, "PostgreSQL")
+    _make_layer(connections_session, "My Layer")
 
     q = rison_lib.dumps(
         {"filters": [{"col": "source_type", "opr": "eq", "value": "database"}]}
@@ -1421,66 +1387,31 @@ def test_connections_source_type_filter(
 
     assert response.status_code == 200
     assert response.json["count"] == 1
-    # Only one query call (for Database), not two
-    mock_db_session.query.assert_called_once()
+    assert response.json["result"][0]["source_type"] == "database"
 
 
 @SEMANTIC_LAYERS_APP
-def test_connections_source_type_semantic_layer_only(
+def test_connections_source_type_semantic_layer(
     client: Any,
     full_api_access: None,
     mocker: MockerFixture,
+    connections_session: Any,
 ) -> None:
-    """Test GET /connections/ with source_type=semantic_layer filter."""
-    from datetime import datetime
-
-    mock_layer = MagicMock()
-    mock_layer.uuid = uuid_lib.uuid4()
-    mock_layer.name = "My Layer"
-    mock_layer.type = "snowflake"
-    mock_layer.description = None
-    mock_layer.cache_timeout = None
-    mock_layer.changed_on = datetime(2026, 1, 1)
-    mock_layer.changed_on_delta_humanized.return_value = "1 day ago"
-    mock_layer.changed_by = None
-
-    mock_db_session = mocker.patch("superset.semantic_layers.api.db.session")
-    sl_query = MagicMock()
-    sl_query.options.return_value = sl_query
-    sl_query.all.return_value = [mock_layer]
-    mock_db_session.query.return_value = sl_query
-
-    mock_cls = MagicMock()
-    mock_cls.name = "Snowflake"
-    mocker.patch.dict(
-        "superset.semantic_layers.api.registry",
-        {"snowflake": mock_cls},
-        clear=True,
-    )
-
-    mocker.patch(
-        "superset.semantic_layers.api.is_feature_enabled",
-        return_value=True,
-    )
-
+    """Test GET /connections/ with source_type=semantic_layer excludes dbs."""
     import prison as rison_lib
 
+    _patch_connections_env(mocker)
+    _make_database(connections_session, "PostgreSQL")
+    _make_layer(connections_session, "My Layer")
+
     q = rison_lib.dumps(
-        {
-            "filters": [
-                {"col": "source_type", "opr": "eq", "value": "semantic_layer"},
-                {"col": "other_col", "opr": "eq", "value": "ignored"},
-            ]
-        }
+        {"filters": [{"col": "source_type", "opr": "eq", "value": "semantic_layer"}]}
     )
     response = client.get(f"/api/v1/semantic_layer/connections/?q={q}")
 
     assert response.status_code == 200
     assert response.json["count"] == 1
-    result = response.json["result"][0]
-    assert result["source_type"] == "semantic_layer"
-    # Only one query (SemanticLayer), no Database query
-    mock_db_session.query.assert_called_once()
+    assert response.json["result"][0]["source_type"] == "semantic_layer"
 
 
 @SEMANTIC_LAYERS_APP
@@ -1488,62 +1419,122 @@ def test_connections_semantic_layer_filters_by_perms(
     client: Any,
     full_api_access: None,
     mocker: MockerFixture,
+    connections_session: Any,
 ) -> None:
-    """Test GET /connections/ applies datasource_access perms to semantic layers."""
-    from datetime import datetime
+    """Test GET /connections/ scopes semantic layers to datasource_access in SQL."""
+    import prison as rison_lib
 
-    mock_layer = MagicMock()
-    mock_layer.uuid = uuid_lib.uuid4()
-    mock_layer.name = "Restricted Layer"
-    mock_layer.type = "snowflake"
-    mock_layer.description = None
-    mock_layer.cache_timeout = None
-    mock_layer.changed_on = datetime(2026, 1, 1)
-    mock_layer.changed_on_delta_humanized.return_value = "1 day ago"
-    mock_layer.changed_by = None
+    from superset.semantic_layers.models import SemanticLayer
 
-    mock_db_session = mocker.patch("superset.semantic_layers.api.db.session")
-    sl_query = MagicMock()
-    sl_query.options.return_value = sl_query
-    sl_query.filter.return_value = sl_query
-    sl_query.all.return_value = [mock_layer]
-    mock_db_session.query.return_value = sl_query
+    _patch_connections_env(mocker, all_access=False)
+    _make_layer(connections_session, "Visible Layer")
+    _make_layer(connections_session, "Hidden Layer")
 
-    mock_cls = MagicMock()
-    mock_cls.name = "Snowflake"
-    mocker.patch.dict(
-        "superset.semantic_layers.api.registry",
-        {"snowflake": mock_cls},
-        clear=True,
-    )
-
-    mocker.patch(
-        "superset.semantic_layers.api.is_feature_enabled",
-        return_value=True,
-    )
-    mocker.patch(
-        "superset.semantic_layers.api.security_manager.can_access_all_datasources",
-        return_value=False,
+    visible_perm = (
+        connections_session.query(SemanticLayer)
+        .filter_by(name="Visible Layer")
+        .one()
+        .perm
     )
     mocker.patch(
         "superset.semantic_layers.api.security_manager.user_view_menu_names",
-        return_value=["[Restricted Layer]"],
+        return_value=[visible_perm],
     )
 
-    import prison as rison_lib
-
     q = rison_lib.dumps(
-        {
-            "filters": [
-                {"col": "source_type", "opr": "eq", "value": "semantic_layer"},
-            ]
-        }
+        {"filters": [{"col": "source_type", "opr": "eq", "value": "semantic_layer"}]}
     )
     response = client.get(f"/api/v1/semantic_layer/connections/?q={q}")
 
     assert response.status_code == 200
     assert response.json["count"] == 1
-    sl_query.filter.assert_called()
+    assert response.json["result"][0]["database_name"] == "Visible Layer"
+
+
+@SEMANTIC_LAYERS_APP
+def test_connections_pagination_bounded_in_sql(
+    client: Any,
+    full_api_access: None,
+    mocker: MockerFixture,
+    connections_session: Any,
+) -> None:
+    """Regression: sort/filter/pagination and the total count run in SQL.
+
+    Requesting page 0 with page_size=1 must issue bounded ``LIMIT`` queries, a
+    separate ``COUNT(*)``, and eager-load ``changed_by`` via a join, so the
+    number of SQL statements touching the connection tables stays constant as
+    the number of connections grows. Before the fix the endpoint loaded every
+    row (no ``LIMIT``/``COUNT(*)`` was emitted) and sorted/sliced in Python.
+    """
+    import prison as rison_lib
+    from sqlalchemy import event
+
+    session = connections_session
+    engine = session.get_bind()
+    _patch_connections_env(mocker)
+    user = _make_user(session)
+
+    statements: list[str] = []
+
+    def _capture(
+        conn: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: Any,
+    ) -> None:
+        statements.append(statement)
+
+    def _conn_statements(stmts: list[str]) -> list[str]:
+        return [
+            s
+            for s in stmts
+            if "from dbs" in s.lower() or "from semantic_layers" in s.lower()
+        ]
+
+    q = rison_lib.dumps(
+        {
+            "page": 0,
+            "page_size": 1,
+            "order_column": "database_name",
+            "order_direction": "asc",
+        }
+    )
+
+    def _run_page(start: int, n_each: int) -> list[str]:
+        for i in range(start, start + n_each):
+            _make_database(session, f"db {i:04d}", changed_by=user)
+            _make_layer(session, f"layer {i:04d}", changed_by=user)
+        statements.clear()
+        event.listen(engine, "before_cursor_execute", _capture)
+        try:
+            response = client.get(f"/api/v1/semantic_layer/connections/?q={q}")
+        finally:
+            event.remove(engine, "before_cursor_execute", _capture)
+        assert response.status_code == 200
+        # page_size=1 across the merged sources yields exactly one row.
+        assert len(response.json["result"]) == 1
+        return list(statements)
+
+    few = _run_page(0, 2)  # 2 databases + 2 layers
+    many = _run_page(2, 20)  # grows to 22 databases + 22 layers
+
+    few_conn = _conn_statements(few)
+    many_conn = _conn_statements(many)
+
+    # Two bounded data queries + two COUNT(*) queries, nothing per row.
+    assert len(few_conn) == 4
+    # total_count is answered with COUNT(*), one per source, not len().
+    assert sum("count(*)" in s.lower() for s in few_conn) == 2
+    # Rows are fetched with a bounded LIMIT rather than materialised in full.
+    assert all(
+        "limit" in s.lower() for s in few_conn if "count(*)" not in s.lower()
+    )
+    # changed_by is eager-loaded via a join (no per-row lazy SELECT).
+    assert any("ab_user" in s.lower() for s in few_conn)
+    # The statement count does not grow with the number of connections.
+    assert len(many_conn) == len(few_conn)
 
 
 # =============================================================================
