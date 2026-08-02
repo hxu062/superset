@@ -16,7 +16,9 @@
 # under the License.
 from __future__ import annotations
 
+import heapq
 import logging
+from itertools import islice
 from typing import Any
 
 from flask import make_response, request, Response
@@ -26,7 +28,8 @@ from flask_appbuilder.models.sqla.interface import SQLAInterface
 from flask_babel import lazy_gettext as t, ngettext
 from marshmallow import ValidationError
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy.orm import load_only
+from sqlalchemy import func
+from sqlalchemy.orm import joinedload, load_only
 
 from superset import db, event_logger, is_feature_enabled, security_manager
 from superset.commands.semantic_layer.create import (
@@ -958,14 +961,36 @@ class SemanticLayerRestApi(BaseSupersetApi):
         if not is_feature_enabled("SEMANTIC_LAYERS"):
             return self.response_404()
 
-        all_items = self._fetch_connection_items(source_type, name_filter)
+        descending = order_direction == "desc"
+        # Over-fetch bound: any item on the requested page must fall within the
+        # top ``(page + 1) * page_size`` rows of its own source, so each source
+        # query stays bounded regardless of how many rows the source holds.
+        over_fetch = (page + 1) * page_size
 
+        sorted_sources: list[list[tuple[str, Any]]] = []
+        total_count = 0
+
+        if source_type in ("all", "database"):
+            rows, count = self._fetch_database_page(
+                name_filter, order_column, descending, over_fetch
+            )
+            sorted_sources.append(rows)
+            total_count += count
+
+        if source_type in ("all", "semantic_layer"):
+            rows, count = self._fetch_semantic_layer_page(
+                name_filter, order_column, descending, over_fetch
+            )
+            sorted_sources.append(rows)
+            total_count += count
+
+        # Each source is already ordered in SQL, so a k-way merge of the
+        # bounded results yields the requested page without materialising the
+        # full listing.
         sort_key = self._get_connection_sort_key(order_column)
-        all_items.sort(key=sort_key, reverse=order_direction == "desc")  # type: ignore
-        total_count = len(all_items)
-
+        merged = heapq.merge(*sorted_sources, key=sort_key, reverse=descending)
         start = page * page_size
-        page_items = all_items[start : start + page_size]
+        page_items = list(islice(merged, start, start + page_size))
 
         result = [
             self._serialize_database(obj)
@@ -991,53 +1016,101 @@ class SemanticLayerRestApi(BaseSupersetApi):
         return source_type, name_filter
 
     @staticmethod
-    def _fetch_connection_items(
-        source_type: str,
+    def _fetch_database_page(
         name_filter: str | None,
-    ) -> list[tuple[str, Any]]:
-        """Fetch database and semantic layer items based on filters."""
-        db_items: list[tuple[str, Database]] = []
-        if source_type in ("all", "database"):
-            db_q = db.session.query(Database).options(
-                load_only(
-                    Database.id,
-                    Database.uuid,
-                    Database.database_name,
-                    Database.sqlalchemy_uri,
-                    Database.allow_run_async,
-                    Database.allow_dml,
-                    Database.allow_file_upload,
-                    Database.expose_in_sqllab,
-                    Database.changed_on,
-                    Database.changed_by_fk,
-                )
-            )
-            if name_filter:
-                db_q = db_q.filter(Database.database_name.ilike(f"%{name_filter}%"))
-            db_items = [("database", obj) for obj in db_q.all()]
+        order_column: str,
+        descending: bool,
+        limit: int,
+    ) -> tuple[list[tuple[str, Database]], int]:
+        """Return a bounded, ordered page of databases plus the total count.
 
-        sl_items: list[tuple[str, SemanticLayer]] = []
-        if source_type in ("all", "semantic_layer"):
-            sl_q = db.session.query(SemanticLayer).options(
-                load_only(
-                    SemanticLayer.uuid,
-                    SemanticLayer.name,
-                    SemanticLayer.type,
-                    SemanticLayer.description,
-                    SemanticLayer.changed_on,
-                    SemanticLayer.changed_by_fk,
-                    SemanticLayer.perm,
-                )
-            )
-            if not security_manager.can_access_all_datasources():
-                perms = security_manager.user_view_menu_names("datasource_access")
-                sl_q = sl_q.filter(SemanticLayer.perm.in_(perms))
-            if name_filter:
-                sl_q = sl_q.filter(SemanticLayer.name.ilike(f"%{name_filter}%"))
-            sl_items = [("semantic_layer", obj) for obj in sl_q.all()]
+        Ordering, filtering and the row limit are expressed in SQL, and
+        ``changed_by`` is eager-loaded so serialising the page issues a
+        constant number of queries independent of the row count.
+        """
+        data_q = db.session.query(Database).options(
+            joinedload(Database.changed_by),
+            load_only(
+                Database.id,
+                Database.uuid,
+                Database.database_name,
+                Database.sqlalchemy_uri,
+                # ``_serialize_database`` reads ``backend``, which decrypts the
+                # URI via ``password``; load it up front to avoid a per-row
+                # deferred SELECT.
+                Database.password,
+                Database.allow_run_async,
+                Database.allow_dml,
+                Database.allow_file_upload,
+                Database.expose_in_sqllab,
+                Database.changed_on,
+                Database.changed_by_fk,
+            ),
+        )
+        count_q = db.session.query(func.count()).select_from(Database)
+        if name_filter:
+            name_predicate = Database.database_name.ilike(f"%{name_filter}%")
+            data_q = data_q.filter(name_predicate)
+            count_q = count_q.filter(name_predicate)
 
-        # TODO: move sort + pagination to SQL before GA.
-        return db_items + sl_items  # type: ignore
+        order_expr = (
+            func.lower(Database.database_name)
+            if order_column == "database_name"
+            else Database.changed_on
+        )
+        data_q = data_q.order_by(
+            order_expr.desc() if descending else order_expr.asc()
+        ).limit(limit)
+
+        rows = [("database", obj) for obj in data_q.all()]
+        return rows, count_q.scalar() or 0
+
+    @staticmethod
+    def _fetch_semantic_layer_page(
+        name_filter: str | None,
+        order_column: str,
+        descending: bool,
+        limit: int,
+    ) -> tuple[list[tuple[str, SemanticLayer]], int]:
+        """Return a bounded, ordered page of semantic layers plus the count.
+
+        Ordering, filtering (including permission scoping) and the row limit
+        are expressed in SQL, and ``changed_by`` is eager-loaded.
+        """
+        data_q = db.session.query(SemanticLayer).options(
+            joinedload(SemanticLayer.changed_by),
+            load_only(
+                SemanticLayer.uuid,
+                SemanticLayer.name,
+                SemanticLayer.type,
+                SemanticLayer.description,
+                SemanticLayer.changed_on,
+                SemanticLayer.changed_by_fk,
+                SemanticLayer.perm,
+            ),
+        )
+        count_q = db.session.query(func.count()).select_from(SemanticLayer)
+        if not security_manager.can_access_all_datasources():
+            perms = security_manager.user_view_menu_names("datasource_access")
+            perm_predicate = SemanticLayer.perm.in_(perms)
+            data_q = data_q.filter(perm_predicate)
+            count_q = count_q.filter(perm_predicate)
+        if name_filter:
+            name_predicate = SemanticLayer.name.ilike(f"%{name_filter}%")
+            data_q = data_q.filter(name_predicate)
+            count_q = count_q.filter(name_predicate)
+
+        order_expr = (
+            func.lower(SemanticLayer.name)
+            if order_column == "database_name"
+            else SemanticLayer.changed_on
+        )
+        data_q = data_q.order_by(
+            order_expr.desc() if descending else order_expr.asc()
+        ).limit(limit)
+
+        rows = [("semantic_layer", obj) for obj in data_q.all()]
+        return rows, count_q.scalar() or 0
 
     @staticmethod
     def _get_connection_sort_key(order_column: str) -> Any:
