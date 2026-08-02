@@ -869,7 +869,7 @@ class EvalHolidayFunc:  # pylint: disable=too-few-public-methods
 
 
 @lru_cache(maxsize=LRU_CACHE_MAX_SIZE)
-def datetime_parser() -> ParseResults:  # pylint: disable=too-many-locals
+def datetime_parser() -> ParserElement:  # pylint: disable=too-many-locals
     (  # pylint: disable=invalid-name
         DATETIME,  # noqa: N806
         DATEADD,  # noqa: N806
@@ -894,17 +894,23 @@ def datetime_parser() -> ParseResults:  # pylint: disable=too-many-locals
     text_operand = quotedString.setName("text_operand").setParseAction(EvalText)
 
     # allow expression to be used recursively
-    datetime_func = Forward().setName("datetime")
-    dateadd_func = Forward().setName("dateadd")
-    datetrunc_func = Forward().setName("datetrunc")
-    lastday_func = Forward().setName("lastday")
-    holiday_func = Forward().setName("holiday")
+    datetime_func: Forward = Forward()
+    datetime_func.setName("datetime")
+    dateadd_func: Forward = Forward()
+    dateadd_func.setName("dateadd")
+    datetrunc_func: Forward = Forward()
+    datetrunc_func.setName("datetrunc")
+    lastday_func: Forward = Forward()
+    lastday_func.setName("lastday")
+    holiday_func: Forward = Forward()
+    holiday_func.setName("holiday")
     date_expr = (
         datetime_func | dateadd_func | datetrunc_func | lastday_func | holiday_func
     )
 
     # literal integer and expression that return a literal integer
-    datediff_func = Forward().setName("datediff")
+    datediff_func: Forward = Forward()
+    datediff_func.setName("datediff")
     int_operand = (
         pyparsing_common.signed_integer().setName("int_operand") | datediff_func
     )
